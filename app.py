@@ -8,6 +8,7 @@ from fastapi.responses import Response
 from PIL import Image
 
 from diffusers import StableDiffusionXLImg2ImgPipeline
+from transformers import CLIPVisionModelWithProjection
 
 # ----------------------------
 # Environment
@@ -15,57 +16,11 @@ from diffusers import StableDiffusionXLImg2ImgPipeline
 MODEL_ID = os.getenv("MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0")
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
-# SDXL runs great on fp16 on A100/A6000/L40S
 TORCH_DTYPE = torch.float16
 
-app = FastAPI(title="SDXL Img2Img API (IP-Adapter)", version="1.1")
+app = FastAPI(title="SDXL Img2Img API (IP-Adapter)", version="1.2")
 
 pipe: Optional[StableDiffusionXLImg2ImgPipeline] = None
-
-
-def _load_pipeline() -> StableDiffusionXLImg2ImgPipeline:
-    """
-    Loads SDXL Img2Img pipeline once, enables IP-Adapter (face),
-    and applies defensive safety disable if present.
-    """
-    global pipe
-    if pipe is not None:
-        return pipe
-
-    # Optional: speed/throughput improvement on Ampere+
-    torch.backends.cuda.matmul.allow_tf32 = True
-
-    pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=TORCH_DTYPE,
-        use_safetensors=True,
-        token=HF_TOKEN,
-    ).to("cuda")
-
-    # ------------------------------------
-    # Defensive safety disable (future-proof)
-    # ------------------------------------
-    if hasattr(pipe, "safety_checker"):
-        pipe.safety_checker = None
-    if hasattr(pipe, "requires_safety_checker"):
-        pipe.requires_safety_checker = False
-
-    # Performance helpers
-    pipe.enable_vae_slicing()
-    pipe.enable_vae_tiling()
-
-    # ----------------------------
-    # IP-ADAPTER (FACE) for identity lock
-    # ----------------------------
-    pipe.load_ip_adapter(
-        "h94/IP-Adapter",
-        subfolder="sdxl_models",
-        weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
-        image_encoder_folder="sdxl_models/image_encoder",
-    )
-
-
-    return pipe
 
 
 def _read_image(file_bytes: bytes) -> Image.Image:
@@ -76,14 +31,11 @@ def _read_image(file_bytes: bytes) -> Image.Image:
 
 
 def _resize_to_multiple_of_8(img: Image.Image, min_side: int = 768, max_side: int = 1536) -> Image.Image:
-    """
-    Keep aspect ratio, clamp to [min_side, max_side] on the long edge,
-    then force multiples of 8 (diffusion-friendly).
-    """
+    # Keep aspect ratio, clamp long edge, then force multiples of 8.
     w, h = img.size
     long_edge = max(w, h)
-    scale = 1.0
 
+    scale = 1.0
     if long_edge < min_side:
         scale = min_side / float(long_edge)
     elif long_edge > max_side:
@@ -103,6 +55,49 @@ def _resize_to_multiple_of_8(img: Image.Image, min_side: int = 768, max_side: in
     return img
 
 
+def _load_pipeline() -> StableDiffusionXLImg2ImgPipeline:
+    global pipe
+    if pipe is not None:
+        return pipe
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    # ✅ Load the correct IP-Adapter image encoder (required for Plus/Face SDXL)
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+        "h94/IP-Adapter",
+        subfolder="models/image_encoder",
+        torch_dtype=TORCH_DTYPE,
+        token=HF_TOKEN,
+    ).to("cuda")
+
+    # ✅ Pass image_encoder into SDXL pipeline (this fixes the 1664 vs 1280 mismatch)
+    pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=TORCH_DTYPE,
+        use_safetensors=True,
+        token=HF_TOKEN,
+        image_encoder=image_encoder,
+    ).to("cuda")
+
+    # Defensive disable (future-proof)
+    if hasattr(pipe, "safety_checker"):
+        pipe.safety_checker = None
+    if hasattr(pipe, "requires_safety_checker"):
+        pipe.requires_safety_checker = False
+
+    pipe.enable_vae_slicing()
+    pipe.enable_vae_tiling()
+
+    # ✅ Load IP-Adapter weights (Plus Face, SDXL, ViT-H)
+    pipe.load_ip_adapter(
+        "h94/IP-Adapter",
+        subfolder="sdxl_models",
+        weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
+    )
+
+    return pipe
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -112,18 +107,13 @@ def health():
 async def edit(
     image: UploadFile = File(...),
     prompt: str = Form(...),
-
-    # Optional knobs with safe defaults
     negative_prompt: str = Form(""),
-    strength: float = Form(0.40),      # 0.25–0.50 typical for prompt-only edits
-    steps: int = Form(32),             # 25–40 typical
-    cfg: float = Form(6.0),            # 5–7 typical
+    strength: float = Form(0.40),
+    steps: int = Form(32),
+    cfg: float = Form(6.0),
     seed: int = Form(-1),
-
-    # IP-Adapter identity lock strength
-    ip_scale: float = Form(0.90),      # 0.6–1.1 typical
+    ip_scale: float = Form(0.90),
 ):
-    # Validate inputs
     if not prompt or not prompt.strip():
         raise HTTPException(status_code=400, detail="prompt is required.")
     if strength <= 0 or strength > 1:
@@ -135,34 +125,29 @@ async def edit(
     if ip_scale < 0 or ip_scale > 1.2:
         raise HTTPException(status_code=400, detail="ip_scale must be between 0 and 1.2.")
 
-    # Read input image
     img_bytes = await image.read()
     init_image = _read_image(img_bytes)
     init_image = _resize_to_multiple_of_8(init_image)
 
-    # Load pipeline + set IP scale per request
     p = _load_pipeline()
     p.set_ip_adapter_scale(ip_scale)
 
-    # Seed control (optional)
     generator = None
     if seed is not None and seed >= 0:
         generator = torch.Generator(device="cuda").manual_seed(seed)
 
-    # Inference
     with torch.inference_mode():
-        result = p(
+        out = p(
             prompt=prompt,
             negative_prompt=negative_prompt.strip() or None,
             image=init_image,
-            ip_adapter_image=init_image,          # identity reference
+            ip_adapter_image=init_image,  # identity reference
             strength=float(strength),
             num_inference_steps=int(steps),
             guidance_scale=float(cfg),
             generator=generator,
         ).images[0]
 
-    # Return PNG
     buf = io.BytesIO()
-    result.save(buf, format="PNG")
+    out.save(buf, format="PNG")
     return Response(content=buf.getvalue(), media_type="image/png")
