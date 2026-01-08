@@ -1,0 +1,10 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pillow==10.4.0
+
+torch==2.4.1
+transformers==4.46.3
+diffusers==0.30.3
+accelerate==1.1.1
+safetensors==0.4.5
+huggingface_hub==0.26.2
