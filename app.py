@@ -60,8 +60,10 @@ def _load_pipeline() -> StableDiffusionXLImg2ImgPipeline:
     pipe.load_ip_adapter(
         "h94/IP-Adapter",
         subfolder="sdxl_models",
-        weight_name="ip-adapter-plus-face_sdxl.safetensors",
+        weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
+        image_encoder_folder="sdxl_models/image_encoder",
     )
+
 
     return pipe
 
