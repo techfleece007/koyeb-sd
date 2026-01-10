@@ -7,68 +7,68 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import Response
 from PIL import Image
 
-from diffusers import StableDiffusionXLImg2ImgPipeline
+from diffusers import (
+    StableDiffusionXLImg2ImgPipeline,
+    StableDiffusionXLPipeline,
+)
 from transformers import CLIPVisionModelWithProjection
 
-# ----------------------------
+# -------------------------------------------------
 # Environment
-# ----------------------------
+# -------------------------------------------------
 MODEL_ID = os.getenv("MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0")
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
 TORCH_DTYPE = torch.float16
 
-app = FastAPI(title="SDXL Img2Img API (IP-Adapter + HF LoRA)", version="1.4")
+app = FastAPI(title="SDXL API (txt2img + img2img + IP-Adapter + LoRA)", version="2.0")
 
-pipe: Optional[StableDiffusionXLImg2ImgPipeline] = None
+img2img_pipe: Optional[StableDiffusionXLImg2ImgPipeline] = None
+txt2img_pipe: Optional[StableDiffusionXLPipeline] = None
 
-
-# ----------------------------
+# -------------------------------------------------
 # Utilities
-# ----------------------------
-def _read_image(file_bytes: bytes) -> Image.Image:
+# -------------------------------------------------
+def read_image(data: bytes) -> Image.Image:
     try:
-        return Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(400, f"Invalid image: {e}")
+        return Image.open(io.BytesIO(data)).convert("RGB")
+    except Exception:
+        raise HTTPException(400, "Invalid image")
 
 
-def _resize_to_multiple_of_8(img: Image.Image) -> Image.Image:
+def resize_to_8(img: Image.Image) -> Image.Image:
     w, h = img.size
     w = max(512, (w // 8) * 8)
     h = max(512, (h // 8) * 8)
     return img.resize((w, h), Image.LANCZOS)
 
 
-def parse_loras(loras_str: str) -> List[Tuple[str, str, float]]:
+def parse_loras(loras: str) -> List[Tuple[str, str, float]]:
     """
     Format:
-    "repo/file:0.5,repo2/file2:0.4"
-
-    Example:
-    "sheko007/koyeb-sd-lora/boltedonlipsXL-v1.safetensors:0.45"
+    repo/file.safetensors:weight,repo2/file2.safetensors:weight
     """
-    if not loras_str:
+    if not loras:
         return []
 
     out = []
-    for part in loras_str.split(","):
-        name_weight = part.strip().rsplit(":", 1)
-        if len(name_weight) != 2:
+    for part in loras.split(","):
+        try:
+            path, weight = part.rsplit(":", 1)
+            repo, file = path.rsplit("/", 1)
+            out.append((repo, file, float(weight)))
+        except Exception:
             continue
-        path, weight = name_weight
-        repo, file = path.rsplit("/", 1)
-        out.append((repo, file, float(weight)))
     return out
 
 
-# ----------------------------
-# Pipeline loader
-# ----------------------------
-def _load_pipeline() -> StableDiffusionXLImg2ImgPipeline:
-    global pipe
-    if pipe is not None:
-        return pipe
+# -------------------------------------------------
+# Pipeline loaders
+# -------------------------------------------------
+def load_img2img() -> StableDiffusionXLImg2ImgPipeline:
+    global img2img_pipe
+    if img2img_pipe is not None:
+        return img2img_pipe
 
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -79,7 +79,7 @@ def _load_pipeline() -> StableDiffusionXLImg2ImgPipeline:
         token=HF_TOKEN,
     ).to("cuda")
 
-    pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+    img2img_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
         MODEL_ID,
         torch_dtype=TORCH_DTYPE,
         use_safetensors=True,
@@ -87,51 +87,123 @@ def _load_pipeline() -> StableDiffusionXLImg2ImgPipeline:
         image_encoder=image_encoder,
     ).to("cuda")
 
-    if hasattr(pipe, "safety_checker"):
-        pipe.safety_checker = None
-    if hasattr(pipe, "requires_safety_checker"):
-        pipe.requires_safety_checker = False
+    # disable safety (defensive)
+    if hasattr(img2img_pipe, "safety_checker"):
+        img2img_pipe.safety_checker = None
+    if hasattr(img2img_pipe, "requires_safety_checker"):
+        img2img_pipe.requires_safety_checker = False
 
-    pipe.enable_vae_slicing()
-    pipe.enable_vae_tiling()
+    img2img_pipe.enable_vae_slicing()
+    img2img_pipe.enable_vae_tiling()
 
-    pipe.load_ip_adapter(
+    img2img_pipe.load_ip_adapter(
         "h94/IP-Adapter",
         subfolder="sdxl_models",
         weight_name="ip-adapter-plus-face_sdxl_vit-h.safetensors",
     )
 
-    return pipe
+    return img2img_pipe
 
 
-# ----------------------------
+def load_txt2img() -> StableDiffusionXLPipeline:
+    global txt2img_pipe
+    if txt2img_pipe is not None:
+        return txt2img_pipe
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=TORCH_DTYPE,
+        use_safetensors=True,
+        token=HF_TOKEN,
+    ).to("cuda")
+
+    if hasattr(txt2img_pipe, "safety_checker"):
+        txt2img_pipe.safety_checker = None
+    if hasattr(txt2img_pipe, "requires_safety_checker"):
+        txt2img_pipe.requires_safety_checker = False
+
+    txt2img_pipe.enable_vae_slicing()
+    txt2img_pipe.enable_vae_tiling()
+
+    return txt2img_pipe
+
+
+# -------------------------------------------------
 # API
-# ----------------------------
+# -------------------------------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
+# -------------------- TXT2IMG --------------------
+@app.post("/generate")
+async def generate(
+    prompt: str = Form(...),
+    negative_prompt: str = Form(""),
+    width: int = Form(1024),
+    height: int = Form(1024),
+    steps: int = Form(30),
+    cfg: float = Form(6.0),
+    seed: int = Form(-1),
+    loras: str = Form(""),
+):
+    if not prompt.strip():
+        raise HTTPException(400, "prompt required")
+
+    p = load_txt2img()
+
+    if hasattr(p, "unload_lora_weights"):
+        p.unload_lora_weights()
+
+    lora_list = parse_loras(loras)
+    if lora_list:
+        names, weights = [], []
+        for repo, file, w in lora_list:
+            p.load_lora_weights(repo, weight_name=file, adapter_name=file)
+            names.append(file)
+            weights.append(w)
+        if hasattr(p, "set_adapters"):
+            p.set_adapters(names, adapter_weights=weights)
+
+    generator = None
+    if seed >= 0:
+        generator = torch.Generator("cuda").manual_seed(seed)
+
+    with torch.inference_mode():
+        img = p(
+            prompt=prompt,
+            negative_prompt=negative_prompt or None,
+            width=width,
+            height=height,
+            num_inference_steps=steps,
+            guidance_scale=cfg,
+            generator=generator,
+        ).images[0]
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return Response(buf.getvalue(), media_type="image/png")
+
+
+# -------------------- IMG2IMG --------------------
 @app.post("/edit")
 async def edit(
     image: UploadFile = File(...),
     prompt: str = Form(...),
     negative_prompt: str = Form(""),
-    strength: float = Form(0.4),
+    strength: float = Form(0.45),
     steps: int = Form(32),
     cfg: float = Form(6.0),
     seed: int = Form(-1),
-    ip_scale: float = Form(0.9),
-
-    # 🔥 HuggingFace LoRAs
-    # Example:
-    # sheko007/koyeb-sd-lora/boltedonlipsXL-v1.safetensors:0.45
+    ip_scale: float = Form(0.7),
     loras: str = Form(""),
 ):
-    img_bytes = await image.read()
-    init_image = _resize_to_multiple_of_8(_read_image(img_bytes))
+    img = resize_to_8(read_image(await image.read()))
 
-    p = _load_pipeline()
+    p = load_img2img()
     p.set_ip_adapter_scale(ip_scale)
 
     if hasattr(p, "unload_lora_weights"):
@@ -140,11 +212,10 @@ async def edit(
     lora_list = parse_loras(loras)
     if lora_list:
         names, weights = [], []
-        for repo, file, weight in lora_list:
+        for repo, file, w in lora_list:
             p.load_lora_weights(repo, weight_name=file, adapter_name=file)
             names.append(file)
-            weights.append(weight)
-
+            weights.append(w)
         if hasattr(p, "set_adapters"):
             p.set_adapters(names, adapter_weights=weights)
 
@@ -156,8 +227,8 @@ async def edit(
         out = p(
             prompt=prompt,
             negative_prompt=negative_prompt or None,
-            image=init_image,
-            ip_adapter_image=init_image,
+            image=img,
+            ip_adapter_image=img,
             strength=strength,
             num_inference_steps=steps,
             guidance_scale=cfg,
