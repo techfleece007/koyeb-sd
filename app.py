@@ -8,25 +8,32 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import Response
 from PIL import Image
 
-from diffusers import StableDiffusionXLImg2ImgPipeline, StableDiffusionXLPipeline
+from diffusers import (
+    StableDiffusionXLPipeline,
+    StableDiffusionXLImg2ImgPipeline,
+)
 from transformers import CLIPVisionModelWithProjection
 
 # -------------------------------------------------
 # Environment
 # -------------------------------------------------
 MODEL_ID = os.getenv("MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0")
-HF_TOKEN = os.getenv("HF_TOKEN", None)
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-TORCH_DTYPE = torch.float16
+DTYPE = torch.float16
+DEVICE = "cuda"
 
-app = FastAPI(title="SDXL API (txt2img + img2img + IP-Adapter + LoRA)", version="2.2")
+app = FastAPI(
+    title="SDXL API (txt2img + img2img + IP-Adapter + LoRA)",
+    version="2.3",
+)
 
-img2img_pipe: Optional[StableDiffusionXLImg2ImgPipeline] = None
 txt2img_pipe: Optional[StableDiffusionXLPipeline] = None
+img2img_pipe: Optional[StableDiffusionXLImg2ImgPipeline] = None
 
 
 # -------------------------------------------------
-# Utilities
+# Utils
 # -------------------------------------------------
 def read_image(data: bytes) -> Image.Image:
     try:
@@ -42,82 +49,84 @@ def resize_to_8(img: Image.Image) -> Image.Image:
     return img.resize((w, h), Image.LANCZOS)
 
 
+def safe_adapter_name(name: str) -> str:
+    name = re.sub(r"[^a-zA-Z0-9_-]+", "_", name)
+    return name.replace(".", "_") or "lora"
+
+
 def parse_loras(loras: str) -> List[Tuple[str, str, float]]:
     """
     Format:
-    repo/file.safetensors:weight,repo2/file2.safetensors:weight
+    repo/file.safetensors:0.7,repo2/file2.safetensors:0.4
     """
     if not loras:
         return []
 
-    out: List[Tuple[str, str, float]] = []
+    out = []
     for part in loras.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            path, weight = part.rsplit(":", 1)
-            repo, file = path.rsplit("/", 1)
-            out.append((repo, file, float(weight)))
-        except Exception:
-            raise HTTPException(
-                400,
-                "Invalid loras format. Use: repo/file.safetensors:0.7,repo2/file2.safetensors:0.4",
-            )
+        path, w = part.rsplit(":", 1)
+        repo, file = path.rsplit("/", 1)
+        out.append((repo, file, float(w)))
     return out
 
 
-def safe_unload_lora(p) -> None:
-    """
-    In some versions, unload_lora_weights requires PEFT.
-    We keep this defensive so the API never crashes.
-    """
-    if hasattr(p, "unload_lora_weights"):
+def unload_loras_safe(pipe):
+    if hasattr(pipe, "unload_lora_weights"):
         try:
-            p.unload_lora_weights()
+            pipe.unload_lora_weights()
         except Exception:
             pass
 
 
-def safe_adapter_name(name: str) -> str:
-    """
-    PEFT forbids dots '.' in adapter names.
-    Also keep names simple to avoid odd edge cases.
-    """
-    # Replace anything not alnum/_/- with underscore
-    name = re.sub(r"[^a-zA-Z0-9_\-]+", "_", name)
-    # Ensure no dots remain
-    name = name.replace(".", "_")
-    # Avoid empty names
-    return name or "lora"
+def apply_loras(pipe, loras: str):
+    unload_loras_safe(pipe)
 
-
-def apply_loras(p, loras_str: str) -> None:
-    safe_unload_lora(p)
-
-    lora_list = parse_loras(loras_str)
-    if not lora_list:
+    parsed = parse_loras(loras)
+    if not parsed:
         return
 
-    adapter_names: List[str] = []
-    adapter_weights: List[float] = []
+    names, weights = [], []
+    for repo, file, w in parsed:
+        adapter = safe_adapter_name(file)
+        pipe.load_lora_weights(repo, weight_name=file, adapter_name=adapter)
+        names.append(adapter)
+        weights.append(w)
 
-    for repo, file, w in lora_list:
-        adapter = safe_adapter_name(file)  # ✅ key fix: no dots
-        p.load_lora_weights(repo, weight_name=file, adapter_name=adapter)
-        adapter_names.append(adapter)
-        adapter_weights.append(float(w))
-
-    if hasattr(p, "set_adapters"):
-        p.set_adapters(adapter_names, adapter_weights=adapter_weights)
+    if hasattr(pipe, "set_adapters"):
+        pipe.set_adapters(names, adapter_weights=weights)
 
 
 # -------------------------------------------------
-# Pipeline loaders
+# Pipelines
 # -------------------------------------------------
+def load_txt2img() -> StableDiffusionXLPipeline:
+    global txt2img_pipe
+    if txt2img_pipe:
+        return txt2img_pipe
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=DTYPE,
+        token=HF_TOKEN,
+        use_safetensors=True,
+    ).to(DEVICE)
+
+    txt2img_pipe.enable_vae_slicing()
+    txt2img_pipe.enable_vae_tiling()
+
+    if hasattr(txt2img_pipe, "safety_checker"):
+        txt2img_pipe.safety_checker = None
+    if hasattr(txt2img_pipe, "requires_safety_checker"):
+        txt2img_pipe.requires_safety_checker = False
+
+    return txt2img_pipe
+
+
 def load_img2img() -> StableDiffusionXLImg2ImgPipeline:
     global img2img_pipe
-    if img2img_pipe is not None:
+    if img2img_pipe:
         return img2img_pipe
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -125,25 +134,25 @@ def load_img2img() -> StableDiffusionXLImg2ImgPipeline:
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(
         "h94/IP-Adapter",
         subfolder="models/image_encoder",
-        torch_dtype=TORCH_DTYPE,
+        torch_dtype=DTYPE,
         token=HF_TOKEN,
-    ).to("cuda")
+    ).to(DEVICE)
 
     img2img_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
         MODEL_ID,
-        torch_dtype=TORCH_DTYPE,
-        use_safetensors=True,
+        torch_dtype=DTYPE,
         token=HF_TOKEN,
+        use_safetensors=True,
         image_encoder=image_encoder,
-    ).to("cuda")
+    ).to(DEVICE)
+
+    img2img_pipe.enable_vae_slicing()
+    img2img_pipe.enable_vae_tiling()
 
     if hasattr(img2img_pipe, "safety_checker"):
         img2img_pipe.safety_checker = None
     if hasattr(img2img_pipe, "requires_safety_checker"):
         img2img_pipe.requires_safety_checker = False
-
-    img2img_pipe.enable_vae_slicing()
-    img2img_pipe.enable_vae_tiling()
 
     img2img_pipe.load_ip_adapter(
         "h94/IP-Adapter",
@@ -152,31 +161,6 @@ def load_img2img() -> StableDiffusionXLImg2ImgPipeline:
     )
 
     return img2img_pipe
-
-
-def load_txt2img() -> StableDiffusionXLPipeline:
-    global txt2img_pipe
-    if txt2img_pipe is not None:
-        return txt2img_pipe
-
-    torch.backends.cuda.matmul.allow_tf32 = True
-
-    txt2img_pipe = StableDiffusionXLPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=TORCH_DTYPE,
-        use_safetensors=True,
-        token=HF_TOKEN,
-    ).to("cuda")
-
-    if hasattr(txt2img_pipe, "safety_checker"):
-        txt2img_pipe.safety_checker = None
-    if hasattr(txt2img_pipe, "requires_safety_checker"):
-        txt2img_pipe.requires_safety_checker = False
-
-    txt2img_pipe.enable_vae_slicing()
-    txt2img_pipe.enable_vae_tiling()
-
-    return txt2img_pipe
 
 
 # -------------------------------------------------
@@ -193,39 +177,31 @@ async def generate(
     negative_prompt: str = Form(""),
     width: int = Form(1024),
     height: int = Form(1024),
-    steps: int = Form(30),
-    cfg: float = Form(6.0),
+    steps: int = Form(35),
+    cfg: float = Form(7.0),
     seed: int = Form(-1),
     loras: str = Form(""),
 ):
-    if not prompt.strip():
-        raise HTTPException(400, "prompt required")
-
-    if width % 8 != 0 or height % 8 != 0:
-        raise HTTPException(400, "width and height must be multiples of 8 (e.g., 1024).")
-    if width < 512 or height < 512 or width > 1536 or height > 1536:
-        raise HTTPException(400, "width/height must be between 512 and 1536.")
-
-    p = load_txt2img()
-    apply_loras(p, loras)
+    pipe = load_txt2img()
+    apply_loras(pipe, loras)
 
     generator = None
     if seed >= 0:
-        generator = torch.Generator("cuda").manual_seed(seed)
+        generator = torch.Generator(DEVICE).manual_seed(seed)
 
     with torch.inference_mode():
-        img = p(
+        img = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt or None,
             width=width,
             height=height,
-            num_inference_steps=int(steps),
-            guidance_scale=float(cfg),
+            num_inference_steps=steps,
+            guidance_scale=cfg,
             generator=generator,
         ).images[0]
 
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.save(buf, "PNG")
     return Response(buf.getvalue(), media_type="image/png")
 
 
@@ -234,37 +210,35 @@ async def edit(
     image: UploadFile = File(...),
     prompt: str = Form(...),
     negative_prompt: str = Form(""),
-    strength: float = Form(0.45),
-    steps: int = Form(32),
-    cfg: float = Form(6.0),
+    strength: float = Form(0.55),
+    steps: int = Form(35),
+    cfg: float = Form(7.0),
     seed: int = Form(-1),
-    ip_scale: float = Form(0.7),
+    ip_scale: float = Form(0.6),
     loras: str = Form(""),
 ):
     img = resize_to_8(read_image(await image.read()))
 
-    p = load_img2img()
-    if hasattr(p, "set_ip_adapter_scale"):
-        p.set_ip_adapter_scale(float(ip_scale))
-
-    apply_loras(p, loras)
+    pipe = load_img2img()
+    pipe.set_ip_adapter_scale(float(ip_scale))
+    apply_loras(pipe, loras)
 
     generator = None
     if seed >= 0:
-        generator = torch.Generator("cuda").manual_seed(seed)
+        generator = torch.Generator(DEVICE).manual_seed(seed)
 
     with torch.inference_mode():
-        out = p(
+        out = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt or None,
             image=img,
             ip_adapter_image=img,
-            strength=float(strength),
-            num_inference_steps=int(steps),
-            guidance_scale=float(cfg),
+            strength=strength,
+            num_inference_steps=steps,
+            guidance_scale=cfg,
             generator=generator,
         ).images[0]
 
     buf = io.BytesIO()
-    out.save(buf, format="PNG")
+    out.save(buf, "PNG")
     return Response(buf.getvalue(), media_type="image/png")
