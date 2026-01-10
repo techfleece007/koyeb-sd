@@ -1,5 +1,6 @@
 import io
 import os
+import re
 from typing import Optional, List, Tuple
 
 import torch
@@ -7,10 +8,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import Response
 from PIL import Image
 
-from diffusers import (
-    StableDiffusionXLImg2ImgPipeline,
-    StableDiffusionXLPipeline,
-)
+from diffusers import StableDiffusionXLImg2ImgPipeline, StableDiffusionXLPipeline
 from transformers import CLIPVisionModelWithProjection
 
 # -------------------------------------------------
@@ -21,7 +19,7 @@ HF_TOKEN = os.getenv("HF_TOKEN", None)
 
 TORCH_DTYPE = torch.float16
 
-app = FastAPI(title="SDXL API (txt2img + img2img + IP-Adapter + LoRA)", version="2.1")
+app = FastAPI(title="SDXL API (txt2img + img2img + IP-Adapter + LoRA)", version="2.2")
 
 img2img_pipe: Optional[StableDiffusionXLImg2ImgPipeline] = None
 txt2img_pipe: Optional[StableDiffusionXLPipeline] = None
@@ -71,15 +69,27 @@ def parse_loras(loras: str) -> List[Tuple[str, str, float]]:
 
 def safe_unload_lora(p) -> None:
     """
-    Diffusers unload_lora_weights requires PEFT in some versions.
-    We make this defensive so the API never crashes.
+    In some versions, unload_lora_weights requires PEFT.
+    We keep this defensive so the API never crashes.
     """
     if hasattr(p, "unload_lora_weights"):
         try:
             p.unload_lora_weights()
         except Exception:
-            # If PEFT is missing or backend mismatch, ignore to avoid 500.
             pass
+
+
+def safe_adapter_name(name: str) -> str:
+    """
+    PEFT forbids dots '.' in adapter names.
+    Also keep names simple to avoid odd edge cases.
+    """
+    # Replace anything not alnum/_/- with underscore
+    name = re.sub(r"[^a-zA-Z0-9_\-]+", "_", name)
+    # Ensure no dots remain
+    name = name.replace(".", "_")
+    # Avoid empty names
+    return name or "lora"
 
 
 def apply_loras(p, loras_str: str) -> None:
@@ -89,14 +99,17 @@ def apply_loras(p, loras_str: str) -> None:
     if not lora_list:
         return
 
-    names, weights = [], []
+    adapter_names: List[str] = []
+    adapter_weights: List[float] = []
+
     for repo, file, w in lora_list:
-        p.load_lora_weights(repo, weight_name=file, adapter_name=file)
-        names.append(file)
-        weights.append(w)
+        adapter = safe_adapter_name(file)  # ✅ key fix: no dots
+        p.load_lora_weights(repo, weight_name=file, adapter_name=adapter)
+        adapter_names.append(adapter)
+        adapter_weights.append(float(w))
 
     if hasattr(p, "set_adapters"):
-        p.set_adapters(names, adapter_weights=weights)
+        p.set_adapters(adapter_names, adapter_weights=adapter_weights)
 
 
 # -------------------------------------------------
@@ -188,7 +201,6 @@ async def generate(
     if not prompt.strip():
         raise HTTPException(400, "prompt required")
 
-    # basic validation to avoid OOM / invalid sizes
     if width % 8 != 0 or height % 8 != 0:
         raise HTTPException(400, "width and height must be multiples of 8 (e.g., 1024).")
     if width < 512 or height < 512 or width > 1536 or height > 1536:
@@ -207,8 +219,8 @@ async def generate(
             negative_prompt=negative_prompt or None,
             width=width,
             height=height,
-            num_inference_steps=steps,
-            guidance_scale=cfg,
+            num_inference_steps=int(steps),
+            guidance_scale=float(cfg),
             generator=generator,
         ).images[0]
 
@@ -232,10 +244,8 @@ async def edit(
     img = resize_to_8(read_image(await image.read()))
 
     p = load_img2img()
-
-    # IP adapter strength
     if hasattr(p, "set_ip_adapter_scale"):
-        p.set_ip_adapter_scale(ip_scale)
+        p.set_ip_adapter_scale(float(ip_scale))
 
     apply_loras(p, loras)
 
