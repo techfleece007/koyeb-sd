@@ -21,10 +21,11 @@ HF_TOKEN = os.getenv("HF_TOKEN", None)
 
 TORCH_DTYPE = torch.float16
 
-app = FastAPI(title="SDXL API (txt2img + img2img + IP-Adapter + LoRA)", version="2.0")
+app = FastAPI(title="SDXL API (txt2img + img2img + IP-Adapter + LoRA)", version="2.1")
 
 img2img_pipe: Optional[StableDiffusionXLImg2ImgPipeline] = None
 txt2img_pipe: Optional[StableDiffusionXLPipeline] = None
+
 
 # -------------------------------------------------
 # Utilities
@@ -51,15 +52,51 @@ def parse_loras(loras: str) -> List[Tuple[str, str, float]]:
     if not loras:
         return []
 
-    out = []
+    out: List[Tuple[str, str, float]] = []
     for part in loras.split(","):
+        part = part.strip()
+        if not part:
+            continue
         try:
             path, weight = part.rsplit(":", 1)
             repo, file = path.rsplit("/", 1)
             out.append((repo, file, float(weight)))
         except Exception:
-            continue
+            raise HTTPException(
+                400,
+                "Invalid loras format. Use: repo/file.safetensors:0.7,repo2/file2.safetensors:0.4",
+            )
     return out
+
+
+def safe_unload_lora(p) -> None:
+    """
+    Diffusers unload_lora_weights requires PEFT in some versions.
+    We make this defensive so the API never crashes.
+    """
+    if hasattr(p, "unload_lora_weights"):
+        try:
+            p.unload_lora_weights()
+        except Exception:
+            # If PEFT is missing or backend mismatch, ignore to avoid 500.
+            pass
+
+
+def apply_loras(p, loras_str: str) -> None:
+    safe_unload_lora(p)
+
+    lora_list = parse_loras(loras_str)
+    if not lora_list:
+        return
+
+    names, weights = [], []
+    for repo, file, w in lora_list:
+        p.load_lora_weights(repo, weight_name=file, adapter_name=file)
+        names.append(file)
+        weights.append(w)
+
+    if hasattr(p, "set_adapters"):
+        p.set_adapters(names, adapter_weights=weights)
 
 
 # -------------------------------------------------
@@ -87,7 +124,6 @@ def load_img2img() -> StableDiffusionXLImg2ImgPipeline:
         image_encoder=image_encoder,
     ).to("cuda")
 
-    # disable safety (defensive)
     if hasattr(img2img_pipe, "safety_checker"):
         img2img_pipe.safety_checker = None
     if hasattr(img2img_pipe, "requires_safety_checker"):
@@ -138,7 +174,6 @@ def health():
     return {"ok": True}
 
 
-# -------------------- TXT2IMG --------------------
 @app.post("/generate")
 async def generate(
     prompt: str = Form(...),
@@ -153,20 +188,14 @@ async def generate(
     if not prompt.strip():
         raise HTTPException(400, "prompt required")
 
+    # basic validation to avoid OOM / invalid sizes
+    if width % 8 != 0 or height % 8 != 0:
+        raise HTTPException(400, "width and height must be multiples of 8 (e.g., 1024).")
+    if width < 512 or height < 512 or width > 1536 or height > 1536:
+        raise HTTPException(400, "width/height must be between 512 and 1536.")
+
     p = load_txt2img()
-
-    if hasattr(p, "unload_lora_weights"):
-        p.unload_lora_weights()
-
-    lora_list = parse_loras(loras)
-    if lora_list:
-        names, weights = [], []
-        for repo, file, w in lora_list:
-            p.load_lora_weights(repo, weight_name=file, adapter_name=file)
-            names.append(file)
-            weights.append(w)
-        if hasattr(p, "set_adapters"):
-            p.set_adapters(names, adapter_weights=weights)
+    apply_loras(p, loras)
 
     generator = None
     if seed >= 0:
@@ -188,7 +217,6 @@ async def generate(
     return Response(buf.getvalue(), media_type="image/png")
 
 
-# -------------------- IMG2IMG --------------------
 @app.post("/edit")
 async def edit(
     image: UploadFile = File(...),
@@ -204,20 +232,12 @@ async def edit(
     img = resize_to_8(read_image(await image.read()))
 
     p = load_img2img()
-    p.set_ip_adapter_scale(ip_scale)
 
-    if hasattr(p, "unload_lora_weights"):
-        p.unload_lora_weights()
+    # IP adapter strength
+    if hasattr(p, "set_ip_adapter_scale"):
+        p.set_ip_adapter_scale(ip_scale)
 
-    lora_list = parse_loras(loras)
-    if lora_list:
-        names, weights = [], []
-        for repo, file, w in lora_list:
-            p.load_lora_weights(repo, weight_name=file, adapter_name=file)
-            names.append(file)
-            weights.append(w)
-        if hasattr(p, "set_adapters"):
-            p.set_adapters(names, adapter_weights=weights)
+    apply_loras(p, loras)
 
     generator = None
     if seed >= 0:
@@ -229,9 +249,9 @@ async def edit(
             negative_prompt=negative_prompt or None,
             image=img,
             ip_adapter_image=img,
-            strength=strength,
-            num_inference_steps=steps,
-            guidance_scale=cfg,
+            strength=float(strength),
+            num_inference_steps=int(steps),
+            guidance_scale=float(cfg),
             generator=generator,
         ).images[0]
 
